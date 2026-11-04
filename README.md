@@ -336,6 +336,7 @@ hermes-chronos/
 ├── tests/
 │   ├── test_chronos.py      # engine, tools, hooks, command
 │   └── test_api.py          # dashboard router
+├── CHANGELOG.md
 ├── CONTRIBUTORS.md
 ├── README.md
 └── LICENSE
