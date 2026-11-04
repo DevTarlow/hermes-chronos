@@ -1,0 +1,51 @@
+name: hermes-chronos
+version: "1.0.0"
+description: "Time-travel filesystem checkpoints and speculative branching for Hermes Agent."
+author: "Hermes Contender"
+license: "MIT"
+requires_hermes: ">=0.19.0"
+
+# Directory plugins are loaded from __init__.py by PluginManager. The
+# `entrypoint` field in the original design brief is only used by pip-installed
+# distributions, so it is deliberately not declared here.
+provides_tools:
+  - chronos_snapshot
+  - chronos_rollback
+  - chronos_diff
+  - chronos_list_checkpoints
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - transform_tool_result
+
+python_dependencies:
+  - "gitpython>=3.1.41,<4.0.0"
+  - "pydantic>=2.0.0,<3.0.0"
+
+config_schema:
+  auto_snapshot:
+    type: bool
+    default: true
+    label: "Automatic checkpoints"
+    description: "Snapshot the workspace before write_file, patch, terminal, execute_code, and other modifying tools."
+  max_checkpoints:
+    type: int
+    default: 50
+    label: "Checkpoints to retain"
+    description: "Number of recent checkpoints shown and kept before the shadow repository is compacted."
+  ignored_patterns:
+    type: list
+    default:
+      - ".git"
+      - ".hermes"
+      - "node_modules"
+      - "venv"
+      - ".venv"
+      - "__pycache__"
+    label: "Ignored paths"
+    description: "Additional gitignore-style patterns Chronos must never snapshot."
+  clean_untracked_on_rollback:
+    type: bool
+    default: true
+    label: "Restore exact snapshots"
+    description: "Remove untracked, non-ignored files during rollback. A safety checkpoint is always created first."
