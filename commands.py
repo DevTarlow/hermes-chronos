@@ -1,4 +1,4 @@
-"""The ``/rewind`` slash command.
+"""The ``/chronos`` slash command.
 
 The command is intentionally text-first: slash-command handlers run in the
 gateway, and returning a string is what the user sees in CLI, Telegram, the TUI
@@ -48,7 +48,7 @@ def _format_list(checkpoints: List[dict], workspace: str, limit: int) -> str:
         return (
             "⏱ **Hermes Chronos** — no checkpoints recorded yet.\n"
             "Chronos snapshots automatically before `write_file`, `patch`, "
-            "`terminal`, and `execute_code`. Run `/rewind` again after a tool call."
+            "`terminal`, and `execute_code`. Run `/chronos` again after a tool call."
         )
     lines = [f"⏱ **Hermes Chronos** — {len(checkpoints)} recent checkpoint(s) in `{workspace}`:"]
     for cp in checkpoints[:limit]:
@@ -60,8 +60,8 @@ def _format_list(checkpoints: List[dict], workspace: str, limit: int) -> str:
             f"{cp.get('tool') or 'manual'}{turn_label} · {_one_line(cp.get('description'))}"
         )
     lines.append("")
-    lines.append("Restore: `/rewind <id|index|latest>` · Inspect: `/rewind --diff <id>`")
-    lines.append("Preview: `/rewind --dry-run <id>` · List: `/rewind --list`")
+    lines.append("Restore: `/chronos <id|index|latest>` · Inspect: `/chronos --diff <id>`")
+    lines.append("Preview: `/chronos --dry-run <id>` · List: `/chronos --list`")
     return "\n".join(lines)
 
 
@@ -86,14 +86,16 @@ def _format_diff(result: dict, checkpoint_id: str) -> str:
 
 def _help_text() -> str:
     return (
-        "⏱ **Hermes Chronos — /rewind**\n"
-        "  `/rewind`                     List recent checkpoints\n"
-        "  `/rewind --list [n]`          List the newest n checkpoints\n"
-        "  `/rewind <id|index|latest>`   Restore the workspace to a checkpoint\n"
-        "  `/rewind --dry-run <id>`      Show what restoring would undo\n"
-        "  `/rewind --diff <id>`         Show the files changed by a checkpoint\n"
-        "  `/rewind --no-clean <id>`     Restore tracked files, keep untracked files\n\n"
-        "A safety checkpoint is created before every restore, so `/rewind` is reversible."
+        "⏱ **Hermes Chronos — /chronos**\n"
+        "  `/chronos`                     List recent checkpoints\n"
+        "  `/chronos --list [n]`          List the newest n checkpoints\n"
+        "  `/chronos <id|index|latest>`   Restore the workspace to a checkpoint\n"
+        "  `/chronos --dry-run <id>`      Show what restoring would undo\n"
+        "  `/chronos --diff <id>`         Show the files changed by a checkpoint\n"
+        "  `/chronos --no-clean <id>`     Restore tracked files, keep untracked files\n"
+        "  `/chronos --no-safety <id>`    Skip the pre-restore safety checkpoint\n"
+        "  `/chronos --compact`           Repack the shadow repository now\n\n"
+        "A safety checkpoint is created before every restore, so `/chronos` is reversible."
     )
 
 
@@ -102,8 +104,8 @@ def _engine_for(ctx: Any, kwargs: dict):
     return get_engine(ctx, workspace=str(workspace) if workspace else None)
 
 
-def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
-    """Handle ``/rewind [--flags] [turn_or_id]`` and return display text."""
+def handle_chronos_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
+    """Handle ``/chronos [--flags] [turn_or_id]`` and return display text."""
     try:
         raw = str(args or "").strip()
         try:
@@ -115,6 +117,7 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
             return _help_text()
 
         clean = _as_bool(_config(ctx, "clean_untracked_on_rollback", True), True)
+        create_safety = True
         action = "restore"
         target: Optional[str] = None
         list_limit = _DEFAULT_LIST
@@ -131,7 +134,7 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
             elif lowered in {"--diff", "diff"}:
                 action = "diff"
                 if index + 1 >= len(tokens):
-                    return "Usage: `/rewind --diff <checkpoint_id>`"
+                    return "Usage: `/chronos --diff <checkpoint_id>`"
                 target = tokens[index + 1]
                 index += 1
             elif lowered in {"--dry-run", "dry-run", "--preview"}:
@@ -143,6 +146,11 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
                 clean = False
             elif lowered in {"--clean", "clean"}:
                 clean = True
+            elif lowered in {"--no-safety", "no-safety"}:
+                # Human surface only: the model tool always keeps the safety net.
+                create_safety = False
+            elif lowered in {"--compact", "compact", "--gc"}:
+                action = "compact"
             elif target is None:
                 target = token
             index += 1
@@ -152,6 +160,15 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
         if action == "list":
             checkpoints = engine.list_checkpoints(limit=list_limit)
             return _format_list(checkpoints, engine.workspace_root, list_limit)
+
+        if action == "compact":
+            result = engine.compact()
+            if result.get("status") == "ok":
+                return (
+                    "🧹 **Chronos compaction complete** — "
+                    f"{result.get('commits', '?')} checkpoint(s) in the shadow history."
+                )
+            return f"❌ **Chronos compaction failed** — {result.get('error', 'unknown error')}"
 
         if action == "diff":
             if not target:
@@ -163,7 +180,7 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
 
         if action == "dry_run":
             if not target:
-                return "Usage: `/rewind --dry-run <checkpoint_id|index|latest>`"
+                return "Usage: `/chronos --dry-run <checkpoint_id|index|latest>`"
             preview = engine.get_diff(target, "WORKTREE")
             if preview.get("status") != "ok":
                 return f"❌ **Chronos preview failed** — {preview.get('error', 'unknown error')}"
@@ -176,7 +193,7 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
             return (
                 f"**Chronos dry run** — restoring `{target}` would undo:\n"
                 f"```diff\n{chr(10).join(lines)}\n```\n"
-                "Run `/rewind "
+                "Run `/chronos "
                 f"{target}` to apply it."
             )
 
@@ -184,30 +201,39 @@ def handle_rewind_command(ctx: Any, args: str = "", **kwargs: Any) -> str:
             checkpoints = engine.list_checkpoints(limit=list_limit)
             return _format_list(checkpoints, engine.workspace_root, list_limit)
 
-        result = engine.rollback(target, clean=clean, create_safety=True)
+        result = engine.rollback(target, clean=clean, create_safety=create_safety)
         if result.get("status") == "ok":
             safety = result.get("safety_checkpoint")
             safety_note = f" Safety checkpoint: `{safety}`." if safety else ""
             removed = result.get("untracked_removed") or 0
             removed_note = f" Removed {removed} untracked file(s)." if clean and removed else ""
             return (
-                f"⏮ **Chronos rewind complete** — restored to `{result.get('restored_checkpoint')}`.\n"
+                f"⏮ **Chronos restore complete** — restored to `{result.get('restored_checkpoint')}`.\n"
                 f"{result.get('files_changed', 0)} file(s) changed.{removed_note}{safety_note}\n"
-                "Use `/rewind --list` to see the timeline."
+                "Use `/chronos --list` to see the timeline."
             )
-        return f"❌ **Chronos rewind failed** — {result.get('error', 'unknown error')}"
+        return f"❌ **Chronos restore failed** — {result.get('error', 'unknown error')}"
     except Exception as exc:  # a slash command must always return text
-        logger.exception("Chronos /rewind command failed")
-        return f"❌ **Chronos rewind failed** — {exc}"
+        logger.exception("Chronos /chronos command failed")
+        return f"❌ **Chronos restore failed** — {exc}"
 
 
-def make_rewind_handler(ctx: Any):
+def make_chronos_handler(ctx: Any):
     """Return a Hermes-compatible ``(raw_args, **session_context) -> str`` handler."""
 
     def _handler(raw_args: str = "", **kwargs: Any) -> str:
-        return handle_rewind_command(ctx, raw_args, **kwargs)
+        return handle_chronos_command(ctx, raw_args, **kwargs)
 
     return _handler
 
 
-__all__ = ["handle_rewind_command", "make_rewind_handler"]
+#: Historical names, kept so older tests/imports keep working.
+handle_rewind_command = handle_chronos_command
+make_rewind_handler = make_chronos_handler
+
+__all__ = [
+    "handle_chronos_command",
+    "handle_rewind_command",
+    "make_chronos_handler",
+    "make_rewind_handler",
+]

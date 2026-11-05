@@ -14,7 +14,7 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-_VERSION = "1.0.0"
+_VERSION = "1.0.1"
 
 
 def _load_module(name: str, path: Path):

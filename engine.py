@@ -22,9 +22,13 @@ Design notes
 * **Rollback is reversible.**  A safety checkpoint of the pre-rollback state is
   taken before any file is touched.
 * **Honest retention.**  Checkpoints are content-addressed git objects.  The
-  engine limits how many are listed and runs ``git gc`` once the history grows
-  past ``max_checkpoints + 10``; Git keeps the deltas, so storage tracks real
-  changes rather than the number of checkpoints.
+  engine limits how many are listed and compacts the shadow repo when history
+  grows past ``max_checkpoints + 10``; Git keeps the deltas, so storage tracks
+  real changes rather than the number of checkpoints.  Compaction runs in a
+  background thread, never inside ``pre_tool_call``.
+* **Every git call has a deadline.**  :func:`git_budget` bounds a whole
+  checkpoint, so a workspace too large to snapshot in the hook's time slice is
+  skipped with a log line instead of stalling the tool call.
 """
 
 import json
@@ -36,6 +40,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -166,6 +171,49 @@ def validate_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
+#: Remaining wall-clock seconds a single checkpoint may spend in git.  Hermes
+#: runs ``pre_tool_call`` with a 30 s callback budget and fails CLOSED when a
+#: callback overruns it, so every git invocation is bounded by this deadline.
+_CALL_DEADLINE: ContextVar[Optional[float]] = ContextVar("chronos_call_deadline", default=None)
+#: Smallest slice worth handing to a subprocess; below this we give up instead.
+_MIN_GIT_SLICE = 0.75
+
+
+@contextmanager
+def git_budget(seconds: Optional[float]):
+    """Bound every git call made inside this block to ``seconds`` wall clock.
+
+    Nested budgets keep the tightest deadline, so a caller that already has a
+    budget (a tool) cannot be stretched by an inner one (a safety checkpoint).
+    "git budget exhausted" is the error raised when the time is gone; callers
+    treat it as "skip this checkpoint", never as "block the tool".
+    """
+    try:
+        requested = float(seconds) if seconds else 0.0
+    except (TypeError, ValueError):
+        requested = 0.0
+    if requested <= 0:
+        yield
+        return
+    outer = _CALL_DEADLINE.get()
+    deadline = time.monotonic() + requested
+    if outer is not None:
+        deadline = min(deadline, outer)
+    token = _CALL_DEADLINE.set(deadline)
+    try:
+        yield
+    finally:
+        _CALL_DEADLINE.reset(token)
+
+
+def _remaining_budget() -> Optional[float]:
+    """Seconds left in the active budget, or ``None`` when no budget is set."""
+    deadline = _CALL_DEADLINE.get()
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
 def resolve_workspace(explicit: Optional[str] = None) -> str:
     """Resolve the workspace for a tool, hook, command, or API call.
 
@@ -265,12 +313,16 @@ class ChronosEngine:
         self.git_dir = os.path.join(self.chronos_dir, "repo")
         self.config_file = os.path.join(self.chronos_dir, "gitconfig")
         self.exclude_file = os.path.join(self.chronos_dir, "exclude")
+        #: Keeps the shadow database invisible to the *user's* git repo.
+        self.shadow_ignore_file = os.path.join(self.chronos_dir, ".gitignore")
         self.lock_file = os.path.join(self.chronos_dir, "lock")
         self.hooks_dir = os.path.join(self.chronos_dir, "hooks")
         self.template_dir = os.path.join(self.chronos_dir, "template")
         self.ignored_patterns = self._normalize_patterns(ignored_patterns)
         self._lock = _thread_lock_for(self.workspace_root)
         self._env = self._build_env()
+        self._compact_guard = threading.Lock()
+        self._compacting = False
 
         if not shutil.which(self.git_executable):
             raise ChronosError(
@@ -300,18 +352,24 @@ class ChronosEngine:
         task_id: str = "",
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Snapshot the workspace and commit it to the shadow database."""
+        """Snapshot the workspace and commit it to the shadow database.
+
+        ``timeout`` bounds the *whole* snapshot, not just one git call.  Hooks
+        pass a short budget so an unexpectedly huge workspace degrades to a
+        logged skip instead of overrunning Hermes' 30 s callback budget.
+        """
         try:
-            with self._exclusive():
-                return self._create_checkpoint_locked(
-                    description,
-                    tool_name=tool_name,
-                    turn_index=turn_index,
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    task_id=task_id,
-                    timeout=timeout,
-                )
+            with git_budget(timeout):
+                with self._exclusive():
+                    return self._create_checkpoint_locked(
+                        description,
+                        tool_name=tool_name,
+                        turn_index=turn_index,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        task_id=task_id,
+                        timeout=timeout,
+                    )
         except ChronosError as exc:
             return {"status": "error", "error": str(exc)}
         except Exception as exc:  # defensive: hooks/tools must never see a raise
@@ -335,69 +393,85 @@ class ChronosEngine:
         restored afterward, so they survive the rollback as untracked files.
         """
         try:
-            with self._exclusive():
-                if not checkpoint_id or not str(checkpoint_id).strip():
-                    return {"status": "error", "error": "A checkpoint id is required."}
-                target = self._resolve_checkpoint_locked(str(checkpoint_id).strip())
-
-                # Capture the untracked set BEFORE the safety checkpoint: the
-                # safety commit stages those files, so after it they are no
-                # longer reported as untracked.
-                untracked_before = self._untracked_locked()
-
-                safety_id: Optional[str] = None
-                safety_hash: Optional[str] = None
-                if create_safety:
-                    safety = self._create_checkpoint_locked(
-                        "Pre-rollback safety snapshot",
-                        tool_name="chronos_rollback",
-                        turn_index=None,
+            with git_budget(timeout):
+                with self._exclusive():
+                    return self._rollback_locked(
+                        checkpoint_id,
+                        clean=clean,
+                        create_safety=create_safety,
                         timeout=timeout,
                     )
-                    if safety.get("status") != "ok":
-                        return {
-                            "status": "error",
-                            "error": "Aborting rollback: could not create a safety checkpoint "
-                            f"({safety.get('error', 'unknown error')}).",
-                        }
-                    safety_id = safety.get("checkpoint_id")
-                    safety_hash = safety.get("commit_hash")
-
-                head = self._head_locked()
-                changes_undone = self._changed_paths_between_locked(target, head) if head else []
-                untracked_removed = 0
-                if clean:
-                    untracked_removed = len(untracked_before)
-                    self._git("clean", "-fd", "--", ".", check=False, timeout=timeout)
-                self._git("read-tree", "--reset", "-u", target, timeout=timeout)
-                self._git("update-index", "-q", "--refresh", check=False, timeout=timeout)
-
-                untracked_preserved = 0
-                if not clean and create_safety and safety_hash and untracked_before:
-                    untracked_preserved = self._restore_untracked_from_commit(
-                        safety_hash, untracked_before, target
-                    )
-
-                summary = self._commit_summary_locked(target)
-                restored = len(self._tracked_paths_locked(target))
-                return {
-                    "status": "ok",
-                    "message": f"Workspace restored to checkpoint {target[:8]}.",
-                    "restored_checkpoint": target[:8],
-                    "restored_hash": target,
-                    "commit_summary": summary,
-                    "safety_checkpoint": safety_id,
-                    "clean": bool(clean),
-                    "files_changed": len(changes_undone),
-                    "restored_files": restored,
-                    "untracked_removed": untracked_removed if clean else 0,
-                    "untracked_preserved": untracked_preserved,
-                }
         except ChronosError as exc:
             return {"status": "error", "error": str(exc)}
         except Exception as exc:
             logger.exception("Chronos rollback failed")
             return {"status": "error", "error": self._safe_error(exc)}
+
+    def _rollback_locked(
+        self,
+        checkpoint_id: str,
+        *,
+        clean: bool = True,
+        create_safety: bool = True,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if not checkpoint_id or not str(checkpoint_id).strip():
+            return {"status": "error", "error": "A checkpoint id is required."}
+        target = self._resolve_checkpoint_locked(str(checkpoint_id).strip())
+
+        # Capture the untracked set BEFORE the safety checkpoint: the safety
+        # commit stages those files, so after it they are no longer reported as
+        # untracked.
+        untracked_before = self._untracked_locked()
+
+        safety_id: Optional[str] = None
+        safety_hash: Optional[str] = None
+        if create_safety:
+            safety = self._create_checkpoint_locked(
+                "Pre-rollback safety snapshot",
+                tool_name="chronos_rollback",
+                turn_index=None,
+                timeout=timeout,
+            )
+            if safety.get("status") != "ok":
+                return {
+                    "status": "error",
+                    "error": "Aborting rollback: could not create a safety checkpoint "
+                    f"({safety.get('error', 'unknown error')}).",
+                }
+            safety_id = safety.get("checkpoint_id")
+            safety_hash = safety.get("commit_hash")
+
+        head = self._head_locked()
+        changes_undone = self._changed_paths_between_locked(target, head) if head else []
+        untracked_removed = 0
+        if clean:
+            untracked_removed = len(untracked_before)
+            self._git("clean", "-fd", "--", ".", check=False, timeout=timeout)
+        self._git("read-tree", "--reset", "-u", target, timeout=timeout)
+        self._git("update-index", "-q", "--refresh", check=False, timeout=timeout)
+
+        untracked_preserved = 0
+        if not clean and create_safety and safety_hash and untracked_before:
+            untracked_preserved = self._restore_untracked_from_commit(
+                safety_hash, untracked_before, target
+            )
+
+        summary = self._commit_summary_locked(target)
+        restored = len(self._tracked_paths_locked(target))
+        return {
+            "status": "ok",
+            "message": f"Workspace restored to checkpoint {target[:8]}.",
+            "restored_checkpoint": target[:8],
+            "restored_hash": target,
+            "commit_summary": summary,
+            "safety_checkpoint": safety_id,
+            "clean": bool(clean),
+            "files_changed": len(changes_undone),
+            "restored_files": restored,
+            "untracked_removed": untracked_removed if clean else 0,
+            "untracked_preserved": untracked_preserved,
+        }
 
     def get_diff(
         self,
@@ -671,7 +745,11 @@ class ChronosEngine:
         commit = self._head_locked()
         if not commit:
             raise ChronosError("Checkpoint commit succeeded but HEAD is invalid.")
-        self._prune_old_checkpoints_locked()
+        # Compaction (reflog expire + git gc) is far too slow to run inside a
+        # tool-call hook: Hermes blocks the tool after 30 s.  Decide here, do it
+        # in the background.
+        if self._compaction_due_locked():
+            self._schedule_compaction()
         return {
             "status": "ok",
             "created": True,
@@ -718,6 +796,7 @@ class ChronosEngine:
 
         self._write_git_config()
         self._write_excludes()
+        self._write_shadow_ignore()
 
         if not self._head_locked():
             self._git("add", "-A", "--", ".", check=False)
@@ -776,6 +855,15 @@ class ChronosEngine:
         check: bool = True,
         timeout: Optional[float] = None,
     ) -> subprocess.CompletedProcess:
+        effective = self.timeout if timeout is None else min(self.timeout, float(timeout))
+        remaining = _remaining_budget()
+        if remaining is not None:
+            if remaining < _MIN_GIT_SLICE:
+                raise ChronosError(
+                    "git budget exhausted; Chronos skipped this operation instead of "
+                    "overrunning the tool-call hook budget"
+                )
+            effective = min(effective, remaining)
         try:
             result = subprocess.run(
                 list(command),
@@ -785,17 +873,29 @@ class ChronosEngine:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout or self.timeout,
+                timeout=effective,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ChronosError(f"git timed out after {timeout or self.timeout:.0f}s") from exc
+            self._drop_stale_index_lock()
+            raise ChronosError(f"git timed out after {effective:.1f}s") from exc
         except OSError as exc:
             raise ChronosError(f"Could not run git: {exc}") from exc
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise ChronosError(f"git {' '.join(command[1:])} failed: {detail[:_MAX_ERROR_CHARS]}")
         return result
+
+    def _drop_stale_index_lock(self) -> None:
+        """Clear a lock left behind by a killed ``git`` (we hold ``_exclusive``)."""
+        for name in ("index.lock", "HEAD.lock"):
+            lock = os.path.join(self.git_dir, name)
+            try:
+                os.remove(lock)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.debug("Chronos could not remove stale %s", lock, exc_info=True)
 
     def _config_set(self, key: str, value: str) -> None:
         result = self._run_raw(
@@ -840,6 +940,33 @@ class ChronosEngine:
                 lines.append(pattern.rstrip("/") + "/**")
         payload = "\n".join(lines) + "\n"
         self._atomic_write(self.exclude_file, payload)
+
+    def _write_shadow_ignore(self) -> None:
+        """Hide ``.hermes/chronos/`` from the *user's* repository.
+
+        Chronos' own ``core.excludesFile`` keeps the database out of snapshots,
+        but nothing stops the user's git from reporting the snapshot database as
+        untracked.  A ``.gitignore`` containing ``*`` inside ``.hermes/chronos/``
+        (the standard trick from ``git init --bare``) makes the whole directory
+        invisible, without touching the user's ``.gitignore`` or their
+        ``.hermes/`` siblings.  It is never snapshotted: ``.hermes`` is excluded.
+        """
+        payload = (
+            "# Written by Hermes Chronos. Keeps the shadow repository out of\n"
+            "# the workspace's own git status. Safe to delete when Chronos is\n"
+            "# uninstalled.\n"
+            "*\n"
+        )
+        try:
+            existing = ""
+            if os.path.exists(self.shadow_ignore_file):
+                with open(self.shadow_ignore_file, "r", encoding="utf-8") as handle:
+                    existing = handle.read()
+            if existing == payload:
+                return
+            self._atomic_write(self.shadow_ignore_file, payload)
+        except OSError:
+            logger.debug("Chronos could not write %s", self.shadow_ignore_file, exc_info=True)
 
     def _normalize_patterns(self, patterns: Optional[Iterable[str]]) -> Tuple[str, ...]:
         raw = list(patterns) if patterns else list(DEFAULT_IGNORED_PATTERNS)
@@ -1067,17 +1194,81 @@ class ChronosEngine:
                 preserved += 1
         return preserved
 
-    def _prune_old_checkpoints_locked(self) -> None:
-        """Bound history growth.  Never raises: a failed prune must not lose a checkpoint."""
+    def _compaction_due_locked(self) -> bool:
+        """True when the shadow repo has outgrown ``max_checkpoints``.
+
+        Cheap on purpose: this runs inside ``pre_tool_call``, so it may only
+        count commits.  The expensive part lives in :meth:`compact`.
+        """
+        if self.max_checkpoints <= 0:
+            return False
+        return self._commit_count_locked() > self.max_checkpoints + 10
+
+    def _schedule_compaction(self) -> bool:
+        """Start one background compaction; never blocks and never raises."""
+        with self._compact_guard:
+            if self._compacting:
+                return False
+            self._compacting = True
+        thread = threading.Thread(
+            target=self._compaction_worker,
+            name=f"chronos-compact:{os.path.basename(self.workspace_root) or 'workspace'}",
+            daemon=True,
+        )
         try:
-            if self.max_checkpoints <= 0:
-                return
-            if self._commit_count_locked() <= self.max_checkpoints + 10:
-                return
-            self._git("reflog", "expire", "--expire=now", "--all", check=False, timeout=min(self.timeout, 60))
-            self._git("gc", "--prune=now", "--quiet", check=False, timeout=min(self.timeout, 120))
-        except Exception:
-            logger.debug("Chronos prune skipped", exc_info=True)
+            thread.start()
+        except RuntimeError:  # interpreter shutting down
+            with self._compact_guard:
+                self._compacting = False
+            return False
+        return True
+
+    def _compaction_worker(self) -> None:
+        try:
+            self.compact()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("Chronos background compaction failed", exc_info=True)
+        finally:
+            with self._compact_guard:
+                self._compacting = False
+
+    def compact(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Expire reflogs and repack the shadow repo.  Call out of the hot path.
+
+        Runs in the background when history outgrows ``max_checkpoints``, and is
+        also exposed for an explicit "compact now" request (dashboard health
+        check, ``hermes-chronos`` maintenance).  Safe to call concurrently: the
+        per-workspace lock serialises it against checkpoints and rollbacks.
+        """
+        try:
+            with self._exclusive():
+                budget = float(timeout) if timeout else max(self.timeout, 120.0)
+                expire = self._git(
+                    "reflog", "expire", "--expire=now", "--all",
+                    check=False, timeout=min(budget, 120.0),
+                )
+                gc = self._git(
+                    "gc", "--prune=now", "--quiet",
+                    check=False, timeout=min(budget, 300.0),
+                )
+                ok = expire.returncode == 0 and gc.returncode == 0
+                if not ok:
+                    logger.info(
+                        "Chronos compaction finished with errors (reflog=%s, gc=%s)",
+                        expire.returncode,
+                        gc.returncode,
+                    )
+                return {
+                    "status": "ok" if ok else "error",
+                    "reflog_exit": expire.returncode,
+                    "gc_exit": gc.returncode,
+                    "commits": self._commit_count_locked(),
+                }
+        except ChronosError as exc:
+            return {"status": "error", "error": str(exc)}
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Chronos compaction failed", exc_info=True)
+            return {"status": "error", "error": self._safe_error(exc)}
 
     # ------------------------------------------------------------------
     # Small helpers

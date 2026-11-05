@@ -1,12 +1,15 @@
 """Lifecycle hooks for Hermes Chronos.
 
-``pre_tool_call`` takes a checkpoint before a workspace-modifying tool runs.
+``pre_tool_call`` takes a checkpoint before a workspace-modifying tool runs and
+puts ``chronos_rollback`` behind Hermes' human-approval gate.
 ``post_tool_call`` classifies the result.  ``transform_tool_result`` adds a
 short, actionable recovery hint to a failed result so the model can inspect or
-undo the change without a human in the loop.
+undo the change.
 
-Hermes treats a raising ``pre_tool_call`` callback as a hard block, so every
-path here is defensive: failures are logged and the tool is allowed to run.
+Hermes treats a raising ``pre_tool_call`` callback as a hard block, and kills a
+callback that overruns ``plugins.hook_callback_timeout`` (30 s by default),
+which also blocks the tool.  So every path here is defensive and
+time-bounded: failures and slowness are logged and the tool is allowed to run.
 """
 
 import json
@@ -16,9 +19,25 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
+from .engine import git_budget
 from .tools import ChronosTools, _as_bool, _config, turn_index_for
 
 logger = logging.getLogger(__name__)
+
+#: The one tool this plugin registers that can destroy user data.
+ROLLBACK_TOOL = "chronos_rollback"
+
+#: Wall-clock budget for a whole auto-checkpoint.  Hermes' ``pre_tool_call``
+#: budget is 30 s and an overrun fails CLOSED, so stay far below it.
+HOOK_BUDGET_SECONDS = 8.0
+#: Consecutive budget overruns before auto-snapshots back off for a workspace.
+_SLOW_FAILURE_LIMIT = 2
+#: How long a workspace stays in slow-mode before one more snapshot is tried.
+_SLOW_BACKOFF_SECONDS = 300.0
+#: workspace -> monotonic deadline until which auto-snapshots are skipped.
+_SLOW_WORKSPACES: Dict[str, float] = {}
+#: workspace -> count of consecutive snapshot attempts that missed the budget.
+_SLOW_STRIKES: Dict[str, int] = {}
 
 #: Built-in tools that can change the workspace.  ``patch`` is Hermes' real
 #: name; ``patch_file`` and ``file_edit`` are accepted aliases for older builds
@@ -162,32 +181,49 @@ class ChronosHooks:
         self.tools = ChronosTools(ctx)
 
     # -- pre_tool_call ---------------------------------------------------
-    def pre_tool_call(self, tool_name: str = "", args: Any = None, **kwargs: Any) -> Optional[Dict[str, str]]:
-        """Checkpoint before a modifying tool.  Never raises, never blocks."""
+    def pre_tool_call(self, tool_name: str = "", args: Any = None, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """Checkpoint before a modifying tool, or gate a rollback behind approval."""
         try:
+            if not isinstance(args, dict):
+                args = {}
+            # Rollback overwrites workspace files and may delete untracked ones,
+            # so the model must not be able to run it unattended.
+            if tool_name == ROLLBACK_TOOL:
+                return self.rollback_approval(args)
             if tool_name not in MODIFYING_TOOLS:
                 return None
             if not _as_bool(_config(self.ctx, "auto_snapshot", True), True):
                 return None
-            if not isinstance(args, dict):
-                args = {}
 
-            engine = self.tools._engine(kwargs)
             description = _describe(tool_name, args)
             session_id = str(kwargs.get("session_id") or "")
             task_id = str(kwargs.get("task_id") or "")
             turn_id = str(kwargs.get("turn_id") or "")
-            checkpoint = engine.create_checkpoint(
-                description,
-                tool_name=tool_name,
-                turn_index=turn_index_for(session_id, task_id, turn_id),
-                session_id=session_id,
-                turn_id=turn_id,
-                task_id=task_id,
-                # Stay well inside Hermes' 30 s pre_tool_call callback budget.
-                timeout=20.0,
-            )
+            # One budget covers engine construction (which may build the shadow
+            # repo and write its baseline commit), the slow-workspace check and
+            # the checkpoint: Hermes kills the callback at 30 s.
+            with git_budget(HOOK_BUDGET_SECONDS):
+                engine = self.tools._engine(kwargs)
+                workspace = str(getattr(engine, "workspace_root", "") or "")
+                if workspace and self._is_slow(workspace):
+                    logger.info(
+                        "Chronos: skipping auto-snapshot for %s in %s; that workspace was too "
+                        "slow to snapshot recently, so the tool runs without a checkpoint",
+                        tool_name,
+                        workspace,
+                    )
+                    return None
+                checkpoint = engine.create_checkpoint(
+                    description,
+                    tool_name=tool_name,
+                    turn_index=turn_index_for(session_id, task_id, turn_id),
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    task_id=task_id,
+                    timeout=HOOK_BUDGET_SECONDS,
+                )
             if checkpoint.get("status") == "ok" and checkpoint.get("checkpoint_id"):
+                self._clear_slow(workspace)
                 key = _pending_key(tool_name, kwargs)
                 with _STATE_LOCK:
                     _prune_locked()
@@ -199,15 +235,90 @@ class ChronosHooks:
                         "_stored_at": time.time(),
                     }
             else:
-                logger.warning(
-                    "Chronos could not checkpoint before %s: %s",
-                    tool_name,
-                    checkpoint.get("error", "unknown error"),
-                )
+                self._note_slow(workspace, tool_name, str(checkpoint.get("error") or "unknown error"))
         except Exception:
             # A pre_tool_call exception fails CLOSED in Hermes (the tool is blocked).
             logger.warning("Chronos pre_tool_call hook failed; allowing the tool", exc_info=True)
         return None
+
+    def rollback_approval(self, args: Any) -> Dict[str, Any]:
+        """Return Hermes' ``approve`` directive for a model-initiated rollback.
+
+        ``{"action": "approve"}`` is the documented way for a plugin to escalate
+        any tool to the human-approval gate; a denial comes back to the model as
+        a blocked tool result, and an approval is executed normally.
+        """
+        args = args if isinstance(args, dict) else {}
+        checkpoint = str(
+            args.get("checkpoint_id") or args.get("id") or args.get("turn_or_id") or "latest"
+        ).strip() or "latest"
+        clean = _as_bool(
+            args.get("clean"),
+            _as_bool(_config(self.ctx, "clean_untracked_on_rollback", True), True),
+        )
+        effect = (
+            "and delete untracked files that are not in the snapshot"
+            if clean
+            else "and keep untracked files"
+        )
+        return {
+            "action": "approve",
+            "message": (
+                f"Chronos wants to restore the workspace to checkpoint `{checkpoint}` {effect}. "
+                "A safety checkpoint of the current state is taken first, so this can be undone."
+            ),
+        }
+
+    # -- slow-workspace backoff -----------------------------------------
+    def _is_slow(self, workspace: str) -> bool:
+        if not workspace:
+            return False
+        now = time.monotonic()
+        with _STATE_LOCK:
+            until = _SLOW_WORKSPACES.get(workspace, 0.0)
+            if until and until <= now:
+                _SLOW_WORKSPACES.pop(workspace, None)
+                return False
+            return until > now
+
+    def _note_slow(self, workspace: str, tool_name: str, error: str) -> None:
+        """Log a failed checkpoint and back off if it keeps missing the budget."""
+        if not workspace:
+            logger.warning("Chronos could not checkpoint before %s: %s", tool_name, error)
+            return
+        timed_out = "budget" in error.lower() or "timed out" in error.lower()
+        if not timed_out:
+            logger.warning("Chronos could not checkpoint before %s: %s", tool_name, error)
+            return
+        with _STATE_LOCK:
+            strikes = _SLOW_STRIKES.get(workspace, 0) + 1
+            _SLOW_STRIKES[workspace] = strikes
+            pause = strikes >= _SLOW_FAILURE_LIMIT
+            if pause:
+                _SLOW_STRIKES.pop(workspace, None)
+                _SLOW_WORKSPACES[workspace] = time.monotonic() + _SLOW_BACKOFF_SECONDS
+        if not pause:
+            logger.warning(
+                "Chronos missed its %.0fs checkpoint budget before %s (%s); retrying once.",
+                HOOK_BUDGET_SECONDS,
+                tool_name,
+                error,
+            )
+            return
+        logger.warning(
+            "Chronos: %s is too large or too slow to checkpoint within %.0fs. Pausing "
+            "auto-snapshots there for %.0f minutes; the tool runs without one. Last error: %s",
+            workspace,
+            HOOK_BUDGET_SECONDS,
+            _SLOW_BACKOFF_SECONDS / 60.0,
+            error,
+        )
+
+    def _clear_slow(self, workspace: str) -> None:
+        if not workspace:
+            return
+        with _STATE_LOCK:
+            _SLOW_STRIKES.pop(workspace, None)
 
     # -- post_tool_call --------------------------------------------------
     def post_tool_call(
@@ -302,4 +413,4 @@ class ChronosHooks:
             return None
 
 
-__all__ = ["ChronosHooks", "MODIFYING_TOOLS"]
+__all__ = ["ChronosHooks", "MODIFYING_TOOLS", "ROLLBACK_TOOL"]

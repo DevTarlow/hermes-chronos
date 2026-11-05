@@ -222,9 +222,12 @@ class ChronosTools:
                     }
                 )
             clean = _as_bool(args.get("clean"), _as_bool(_config(self.ctx, "clean_untracked_on_rollback", True), True))
-            create_safety = not _as_bool(args.get("no_safety"), False)
+            # The model tool never skips the safety checkpoint: a rollback that
+            # cannot be undone is exactly the failure mode Chronos exists to
+            # prevent.  ``no_safety`` stays available to the human surfaces
+            # (``/chronos --no-safety`` and the Desktop pane's create_safety).
             engine = self._engine(kwargs)
-            return _json(engine.rollback(checkpoint_id, clean=clean, create_safety=create_safety))
+            return _json(engine.rollback(checkpoint_id, clean=clean, create_safety=True))
         except Exception as exc:
             logger.debug("chronos_rollback failed", exc_info=True)
             return _error(exc)

@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -43,7 +45,10 @@ from hermes_chronos.engine import (  # noqa: E402
 )
 from hermes_chronos.hooks import ChronosHooks  # noqa: E402
 from hermes_chronos.tools import ChronosTools  # noqa: E402
-from hermes_chronos.commands import handle_rewind_command  # noqa: E402
+from hermes_chronos.commands import (  # noqa: E402
+    handle_chronos_command,
+    handle_rewind_command,
+)
 
 
 class FakeCtx:
@@ -396,24 +401,24 @@ class ToolsAndHooksTestCase(unittest.TestCase):
         self.assertIsNone(self.hooks.post_tool_call("write_file", None, None))
         self.assertIsNone(self.hooks.transform_tool_result("write_file", None, None))
 
-    def test_rewind_command_lists_and_restores(self):
+    def test_chronos_command_lists_and_restores(self):
         self.write("a.txt", "v1\n")
         cp = json.loads(self.tools.snapshot({"description": "v1"}))
         self.write("a.txt", "v2\n")
         self.tools.snapshot({"description": "v2"})
 
-        listing = handle_rewind_command(self.ctx, "")
+        listing = handle_chronos_command(self.ctx, "")
         self.assertIn("Hermes Chronos", listing)
         self.assertIn(cp["checkpoint_id"], listing)
 
-        restored = handle_rewind_command(self.ctx, cp["checkpoint_id"])
-        self.assertIn("rewind complete", restored.lower())
+        restored = handle_chronos_command(self.ctx, cp["checkpoint_id"])
+        self.assertIn("restore complete", restored.lower())
         self.assertEqual((self.workspace / "a.txt").read_text(), "v1\n")
 
         # The worktree can differ from HEAD after a rollback (HEAD may be a
         # safety snapshot), so dry-run must compare against the worktree.
         self.write("a.txt", "v3\n")
-        preview = handle_rewind_command(self.ctx, f"--dry-run {cp['checkpoint_id']}")
+        preview = handle_chronos_command(self.ctx, f"--dry-run {cp['checkpoint_id']}")
         self.assertIn("dry run", preview.lower())
         self.assertIn("v3", preview)
 
@@ -441,7 +446,127 @@ class ToolsAndHooksTestCase(unittest.TestCase):
             set(ctx.hooks),
             {"pre_tool_call", "post_tool_call", "transform_tool_result"},
         )
-        self.assertEqual(commands, ["rewind"])
+        self.assertEqual(commands, ["chronos"])
+
+    # -- review follow-ups ------------------------------------------------
+    def test_rollback_tool_has_no_unattended_no_safety_path(self):
+        schema = PLUGIN.ROLLBACK_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("no_safety", schema)
+        self.assertEqual(set(schema), {"checkpoint_id", "clean"})
+
+        self.write("a.txt", "v1\n")
+        cp = json.loads(self.tools.snapshot({"description": "v1"}))
+        self.write("a.txt", "v2\n")
+        # ``no_safety`` is ignored even if a model still sends it.
+        restored = json.loads(
+            self.tools.rollback({"checkpoint_id": cp["checkpoint_id"], "no_safety": True})
+        )
+        self.assertEqual(restored["status"], "ok")
+        self.assertTrue(restored["safety_checkpoint"])
+        self.assertEqual((self.workspace / "a.txt").read_text(), "v1\n")
+
+    def test_model_rollback_requires_human_approval(self):
+        directive = self.hooks.pre_tool_call(
+            "chronos_rollback",
+            {"checkpoint_id": "abc12345", "clean": True},
+            session_id="s",
+            tool_call_id="c",
+        )
+        self.assertIsInstance(directive, dict)
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("abc12345", directive["message"])
+        self.assertIn("untracked", directive["message"])
+
+        # A non-clean rollback still overwrites files, so it is gated too.
+        keep = self.hooks.pre_tool_call("chronos_rollback", {"checkpoint_id": "1", "clean": False})
+        self.assertEqual(keep["action"], "approve")
+        self.assertIn("keep untracked", keep["message"])
+
+        # Other tools are unaffected by the gate.
+        self.assertIsNone(self.hooks.pre_tool_call("read_file", {"path": "a.txt"}))
+
+    def test_shadow_database_is_hidden_from_the_users_repo(self):
+        self.write("code.py", "print(1)\n")
+        subprocess.run(["git", "init", "-q", str(self.workspace)], check=True)
+        subprocess.run(["git", "-C", str(self.workspace), "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(self.workspace),
+                "-c", "user.name=t", "-c", "user.email=t@example.com",
+                "commit", "-qm", "baseline",
+            ],
+            check=True,
+        )
+
+        # First real use builds <workspace>/.hermes/chronos/.
+        self.tools.snapshot({"description": "after chronos init"})
+        ignore = self.workspace / ".hermes" / "chronos" / ".gitignore"
+        self.assertTrue(ignore.is_file())
+        self.assertIn("*", ignore.read_text().splitlines())
+
+        self.write("code.py", "print(2)\n")
+        self.tools.snapshot({"description": "second"})
+        status = subprocess.run(
+            ["git", "-C", str(self.workspace), "status", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertNotIn(".hermes", status)
+        self.assertIn("code.py", status)
+
+    def test_checkpoint_budget_skips_instead_of_hanging(self):
+        self.write("a.txt", "v1\n")
+        engine = self.tools._engine()
+        started = time.time()
+        result = engine.create_checkpoint("too slow", timeout=0.2)
+        elapsed = time.time() - started
+        self.assertEqual(result["status"], "error")
+        self.assertIn("budget", result["error"].lower())
+        self.assertLess(elapsed, 5.0)
+
+    def test_slow_workspace_backs_off_instead_of_blocking_the_tool(self):
+        from hermes_chronos import hooks as hooks_module
+
+        self.write("a.txt", "v1\n")
+        self.tools.snapshot({"description": "warm the engine cache"})
+        workspace = self.tools._engine().workspace_root
+
+        original = hooks_module.HOOK_BUDGET_SECONDS
+        hooks_module.HOOK_BUDGET_SECONDS = 0.05
+        try:
+            for call in ("c1", "c2"):
+                self.assertIsNone(
+                    self.hooks.pre_tool_call(
+                        "write_file", {"path": "a.txt"}, session_id="s", tool_call_id=call
+                    )
+                )
+            self.assertTrue(self.hooks._is_slow(workspace))
+            started = time.time()
+            self.assertIsNone(
+                self.hooks.pre_tool_call(
+                    "write_file", {"path": "a.txt"}, session_id="s", tool_call_id="c3"
+                )
+            )
+            self.assertLess(time.time() - started, 1.0)
+        finally:
+            hooks_module.HOOK_BUDGET_SECONDS = original
+            hooks_module._SLOW_WORKSPACES.clear()
+            hooks_module._SLOW_STRIKES.clear()
+
+    def test_compaction_is_scheduled_out_of_band(self):
+        engine = self.tools._engine()
+        engine.max_checkpoints = 1
+        compacted = threading.Event()
+
+        def fake_compact(timeout=None):
+            compacted.set()
+            return {"status": "ok"}
+
+        engine.compact = fake_compact
+        for index in range(13):
+            self.write(f"f{index}.txt", f"{index}\n")
+            engine.create_checkpoint(f"cp {index}")
+
+        self.assertTrue(compacted.wait(10.0), "background compaction never ran")
 
 
 if __name__ == "__main__":

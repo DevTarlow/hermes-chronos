@@ -8,7 +8,7 @@ you can inspect the diff and put the workspace back. The snapshots live in a
 private shadow git repository. The project's own `.git`, its branches, commits,
 stashes, and hooks are left alone.
 
-Current release: `1.0.0`. Tested on Hermes 0.19.0 and the September 2026 source
+Current release: `1.0.1`. Tested on Hermes 0.19.0 and the September 2026 source
 tree.
 
 ```
@@ -27,7 +27,7 @@ write_file / patch / terminal / execute_code
         └───────────────────┘                  "rollback with abc12345"
                   │
                   ▼
-     chronos_rollback / /rewind / Desktop pane
+     chronos_rollback / /chronos / Desktop pane
                   │
                   ▼
         safety checkpoint ──► restore files ──► workspace
@@ -53,11 +53,18 @@ write_file / patch / terminal / execute_code
 - **Desktop timeline.** A native Hermes Desktop pane (`desktop/plugin.js`)
   lists checkpoints, previews the file diff, and restores with a two-step
   button. The pane polls its scoped backend every five seconds.
-- **Interactive `/rewind`.** List, inspect, dry-run, or restore from any Hermes
-  surface: CLI, TUI, Desktop, or messaging gateway.
+- **Interactive `/chronos`.** List, inspect, dry-run, or restore from any Hermes
+  surface: CLI, TUI, Desktop, or messaging gateway. The model's
+  `chronos_rollback` and the slash command both stop at Hermes' approval prompt
+  before overwriting workspace files.
 - **Guard rails.** Root and home directories are refused. Ignored paths such as
-  `node_modules` and `.venv` are never touched, and a failed snapshot is logged
-  instead of blocking the tool.
+  `node_modules` and `.venv` are never touched. A snapshot is bounded by an 8 s
+  budget, well inside `pre_tool_call`'s 30 s window: if a workspace is too large
+  to snapshot in time, Chronos logs it and the tool runs without a checkpoint.
+- **Approval before rollback.** The model's `chronos_rollback` returns Hermes'
+  `{"action": "approve"}` directive, so a human confirms every restore (and a
+  denial comes back as a blocked tool result). The model tool also has no
+  `no_safety` flag: it always writes a safety checkpoint first.
 
 ## Install
 
@@ -125,7 +132,7 @@ Failures contain `"status": "error"` and `"error"`.
 | Tool | What it does |
 | --- | --- |
 | `chronos_snapshot` | Take a checkpoint now. Args: `description` (required), `tool_name`. |
-| `chronos_rollback` | Restore a checkpoint. Args: `checkpoint_id`, `clean`, `no_safety`. |
+| `chronos_rollback` | Restore a checkpoint. Args: `checkpoint_id`, `clean`. Always asks the user to approve first, and always writes a safety checkpoint. |
 | `chronos_diff` | Diff between checkpoints or the working tree. Args: `from_checkpoint`, `to_checkpoint`, `checkpoint_id`, `max_chars`. |
 | `chronos_list_checkpoints` | Recent checkpoints with ids, tools, turns, and timestamps. Arg: `limit`. |
 
@@ -155,14 +162,16 @@ number of files changed, and the untracked-file counts:
 ## Slash command
 
 ```text
-/rewind                       list the newest checkpoints
-/rewind --list 15             list 15
-/rewind 3                     restore the 3rd newest checkpoint
-/rewind latest                restore the newest checkpoint
-/rewind 1a2b3c4d              restore by id
-/rewind --diff 1a2b3c4d       show the files changed by a checkpoint
-/rewind --dry-run 3           preview what restoring would undo
-/rewind --no-clean 1a2b3c4d   restore tracked files, keep untracked files
+/chronos                       list the newest checkpoints
+/chronos --list 15             list 15
+/chronos 3                     restore the 3rd newest checkpoint
+/chronos latest                restore the newest checkpoint
+/chronos 1a2b3c4d              restore by id
+/chronos --diff 1a2b3c4d       show the files changed by a checkpoint
+/chronos --dry-run 3           preview what restoring would undo
+/chronos --no-clean 1a2b3c4d   restore tracked files, keep untracked files
+/chronos --no-safety 1a2b3c4d  skip the pre-restore safety checkpoint
+/chronos --compact             repack the shadow repository now
 ```
 
 Rollback always takes a safety checkpoint first. `--dry-run` compares the
@@ -213,10 +222,12 @@ path, so the backend cannot rely on package-relative imports.
    and a fixed author identity. User aliases and hooks cannot run.
 4. `git add -A` stages the workspace. `git diff --cached --quiet HEAD` detects
    no-op snapshots. `git commit` writes a `CHRONOS_CP: {json}` message.
-5. Rollback takes a safety checkpoint, then runs
+5. `.hermes/chronos/.gitignore` contains `*`, so the snapshot database never
+   appears in the project's own `git status`.
+6. Rollback takes a safety checkpoint, then runs
    `git read-tree --reset -u <checkpoint>`. `HEAD` does not move, so the next
    checkpoint is a normal forward commit and no checkpoint becomes unreachable.
-6. With `clean: true`, untracked, non-ignored files are removed so the tree
+7. With `clean: true`, untracked, non-ignored files are removed so the tree
    matches the snapshot. With `clean: false`, those files are restored from the
    safety commit and left untracked.
 
@@ -232,10 +243,13 @@ path, so the backend cannot rely on package-relative imports.
 - **A clean rollback deletes untracked, non-ignored files** to match the
   snapshot exactly. The safety checkpoint captures those files first, so the
   restore can be reversed. Set `clean: false` or use `--no-clean` to keep them.
-- **`.hermes/` may show up in your own `git status`.** Chronos excludes it from
-  its snapshots but does not edit the project's `.git/info/exclude`. Add
-  `.hermes/` to `.gitignore` if you do not want it listed.
-- **`max_checkpoints` bounds the listing and triggers compaction.** Git stores
+- **`.hermes/chronos/` never shows up in your own `git status`.** Chronos writes
+  a `.gitignore` containing `*` inside that directory (the same trick
+  `git init --bare` uses), so it does not touch your `.gitignore` or your other
+  `.hermes/` content.
+- **`max_checkpoints` bounds the listing and triggers compaction.** Once history
+  passes `max_checkpoints + 10`, a background thread expires reflogs and repacks
+  the shadow repo; `git gc` never runs inside a tool-call hook. Git stores
   content-addressed deltas, so a quiet workspace stays small even with a long
   checkpoint list.
 - **Git is required.** Snapshot failures are logged and never block a tool.
@@ -254,8 +268,8 @@ path, so the backend cannot rely on package-relative imports.
   workspace during an explicit rollback.
 - Spawns local `git` subprocesses. No network calls, no telemetry, no remote
   repositories, no shell.
-- Runs `git gc` on the shadow repository when history exceeds
-  `max_checkpoints + 10`.
+- Compacts the shadow repository (reflog expire + `git gc`) in a background
+  thread once history exceeds `max_checkpoints + 10`; never inside a tool call.
 - Does not read credentials, `.env` files, or Hermes auth stores.
 - Does not update itself. Updates go through Hermes and the catalog pin.
 
@@ -273,7 +287,7 @@ python -m unittest discover -s tests -v
 ```
 
 Expected: `validate` reports every check green with no warnings, `doctor`
-reports 4 tools and 3 hooks, and all 23 tests pass.
+reports 4 tools and 3 hooks, and all 29 tests pass.
 
 ### Acceptance results
 
@@ -284,7 +298,7 @@ against a working tree.
 | --- | --- |
 | Catalog validation | 16/16 checks, 0 warnings |
 | Doctor | 4 tools, 3 hooks, no load error |
-| Test suite | 23/23 passed |
+| Test suite | 29/29 passed |
 | Real hook/tool pipeline | 33/33 checks |
 | Config behavior | 8/8 checks |
 | Dashboard mount and API | 14/14 checks |
@@ -292,8 +306,11 @@ against a working tree.
 | Desktop registration and render | 16/16 checks |
 
 The runtime checks cover real `write_file` and `patch` calls through Hermes,
-failure-hint injection, rollback, safety-checkpoint undo, `/rewind`, user
-`.git` isolation, ignored paths, and JSON error envelopes.
+failure-hint injection, rollback, safety-checkpoint undo, `/chronos`, user
+`.git` isolation, ignored paths, and JSON error envelopes. Regression tests also
+pin the review fixes: no `no_safety` on the model tool, an `approve` directive
+for `chronos_rollback`, a `.gitignore` over the shadow database, a bounded
+checkpoint budget, and background-only compaction.
 
 ## Catalog submission
 
@@ -326,7 +343,7 @@ hermes-chronos/
 ├── engine.py                # isolated shadow-git engine
 ├── tools.py                 # chronos_* tool handlers + JSON contracts
 ├── hooks.py                 # pre/post/transform lifecycle hooks
-├── commands.py              # /rewind
+├── commands.py              # /chronos
 ├── api.py                   # FastAPI router builder
 ├── dashboard/
 │   ├── manifest.json        # backend mount declaration
