@@ -15,7 +15,7 @@ from .tools import ChronosTools
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "hermes-chronos"
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.0.2"
 TOOLSET = "chronos"
 
 SNAPSHOT_SCHEMA = {

@@ -98,7 +98,7 @@ def build_router(
     settings_loader: Optional[Callable[[], Dict[str, Any]]] = None,
     default_cwd: Optional[Callable[[], str]] = None,
     *,
-    version: str = "1.0.1",
+    version: str = "1.0.2",
 ) -> APIRouter:
     """Build the Chronos API router.
 

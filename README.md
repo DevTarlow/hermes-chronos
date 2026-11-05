@@ -8,8 +8,19 @@ you can inspect the diff and put the workspace back. The snapshots live in a
 private shadow git repository. The project's own `.git`, its branches, commits,
 stashes, and hooks are left alone.
 
-Current release: `1.0.1`. Tested on Hermes 0.19.0 and the September 2026 source
+Current release: `1.0.2`. Tested on Hermes 0.19.0 and the September 2026 source
 tree.
+
+## Demo
+
+- **88-second launch film** — [Hermes Chronos — Never Restart a Workspace Again](https://www.youtube.com/watch?v=s2k0PBo5SO4) (YouTube)
+- **Short cut** — [@MossAIStudio on X](https://x.com/MossAIStudio/status/2118152188690362610/video/1)
+
+The film was recorded against `1.0.0`, so two moments are out of date: it shows
+the model calling `chronos_rollback` with no approval step, and it shows
+`/rewind` in the CLI. In `1.0.1` and later every model rollback stops at Hermes'
+approval prompt first, and the command is `/chronos` (`rewind` is a Hermes
+built-in). Everything else in the film matches the shipped plugin.
 
 ```
 write_file / patch / terminal / execute_code

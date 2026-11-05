@@ -1,5 +1,5 @@
 name: hermes-chronos
-version: "1.0.1"
+version: "1.0.2"
 description: "Time-travel filesystem checkpoints and speculative branching for Hermes Agent."
 author: "Hermes Contender"
 license: "MIT"

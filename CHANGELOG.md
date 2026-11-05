@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.2 - 2026-11-05
+
+- **Demo links in the README.** The 88-second launch film
+  ([YouTube](https://www.youtube.com/watch?v=s2k0PBo5SO4)) and the short X cut
+  ([@MossAIStudio](https://x.com/MossAIStudio/status/2118152188690362610/video/1))
+  are linked from the README, which is what the catalog renders. The film was
+  recorded against `1.0.0`; the README notes the two moments that predate the
+  approval gate and the `/chronos` rename.
+- Documentation only, no code changes.
+
 ## 1.0.1 - 2026-11-05
 
 Review follow-ups for the Hermes catalog submission.
