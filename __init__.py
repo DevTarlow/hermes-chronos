@@ -15,7 +15,7 @@ from .tools import ChronosTools
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "hermes-chronos"
-PLUGIN_VERSION = "1.0.2"
+PLUGIN_VERSION = "1.0.3"
 TOOLSET = "chronos"
 
 SNAPSHOT_SCHEMA = {
@@ -47,7 +47,9 @@ ROLLBACK_SCHEMA = {
         "Restore workspace files to a previous Chronos checkpoint after a failed test, broken "
         "build, corrupted config, or bad refactor. A safety checkpoint of the current state is "
         "created first, so the rollback can itself be undone. Hermes asks the user to approve "
-        "every rollback before it runs."
+        "every rollback before it runs. Only files under the workspace are restored: database, "
+        "service, remote-API, and git-remote changes are not reverted, so report any that may "
+        "still be applied rather than saying the failure is undone."
     ),
     "parameters": {
         "type": "object",

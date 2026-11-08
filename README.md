@@ -8,7 +8,7 @@ you can inspect the diff and put the workspace back. The snapshots live in a
 private shadow git repository. The project's own `.git`, its branches, commits,
 stashes, and hooks are left alone.
 
-Current release: `1.0.2`. Tested on Hermes 0.19.0 and the September 2026 source
+Current release: `1.0.3`. Tested on Hermes 0.19.0 and the September 2026 source
 tree.
 
 ## Demo
@@ -51,9 +51,10 @@ write_file / patch / terminal / execute_code
   creates, or rewrites the user's `.git`, and it works in projects that are not
   git repositories at all.
 - **Automatic snapshots.** `pre_tool_call` snapshots before `write_file`,
-  `patch`, `terminal`, `execute_code`, `skill_manage`, and compatible aliases.
+  `patch`, `terminal`, `execute_code`, and compatible aliases.
   The checkpoint records the tool, turn, session, timestamp, and a short
-  description.
+  description. `skill_manage` does not trigger a checkpoint: it writes to
+  `$HERMES_HOME/skills`, outside the workspace, so there is nothing to snapshot.
 - **Recovery hints.** When a tool result looks like a failure,
   `transform_tool_result` appends a short notice naming the checkpoint and the
   exact `chronos_diff` / `chronos_rollback` calls. The model can recover without
@@ -244,6 +245,31 @@ path, so the backend cannot rely on package-relative imports.
 
 ## Safety and limitations
 
+### What a rollback does not undo
+
+Restoring a checkpoint rewrites files under the workspace and nothing else. A
+green "restored" result means the *files* are back — not that the world is. An
+agent that ran a migration, hit an API, or pushed a branch still changed all
+three:
+
+| Still applied after a rollback | Why Chronos misses it |
+| --- | --- |
+| Databases: migrations already run, rows already written | outside the workspace |
+| Running services, containers, deployed artifacts | outside the workspace |
+| Remote APIs, cloud resources, webhooks already sent | outside the workspace |
+| Your own `.git`: commits, tags, and **pushed** remote history | `.git` is deliberately excluded |
+| Files outside the workspace (`~/.bashrc`, `/etc`, other repos) | the work tree is the workspace |
+| Installed packages, caches, cron/systemd, shell history | never observed |
+
+`terminal` and `execute_code` can do all of these. Nothing in Chronos observes
+or verifies them: the checkpoint records that the tool was about to run, not
+what it did elsewhere. The recovery hint and the approval prompt say this, and
+each checkpoint stores the tool name and a short command snippet so you can see
+what ran — but the check itself is yours. Verify the database or the service
+before reporting a failure as undone.
+
+### Other limits
+
 - **Not a sandbox.** Chronos runs with the user's permissions, like every
   in-process Hermes plugin. It only snapshots and restores files inside the
   session workspace.
@@ -277,6 +303,9 @@ path, so the backend cannot rely on package-relative imports.
 - Reads files in the active workspace to build checkpoints.
 - Writes only under `<workspace>/.hermes/chronos/` and restores files in the
   workspace during an explicit rollback.
+- Restores workspace files only. It cannot revert databases, running services,
+  remote APIs, git remotes, or files outside the workspace, and it does not
+  claim to — see [What a rollback does not undo](#what-a-rollback-does-not-undo).
 - Spawns local `git` subprocesses. No network calls, no telemetry, no remote
   repositories, no shell.
 - Compacts the shadow repository (reflog expire + `git gc`) in a background
@@ -298,7 +327,7 @@ python -m unittest discover -s tests -v
 ```
 
 Expected: `validate` reports every check green with no warnings, `doctor`
-reports 4 tools and 3 hooks, and all 29 tests pass.
+reports 4 tools and 3 hooks, and all 32 tests pass.
 
 ### Acceptance results
 
@@ -309,7 +338,7 @@ against a working tree.
 | --- | --- |
 | Catalog validation | 16/16 checks, 0 warnings |
 | Doctor | 4 tools, 3 hooks, no load error |
-| Test suite | 29/29 passed |
+| Test suite | 32/32 passed |
 | Real hook/tool pipeline | 33/33 checks |
 | Config behavior | 8/8 checks |
 | Dashboard mount and API | 14/14 checks |

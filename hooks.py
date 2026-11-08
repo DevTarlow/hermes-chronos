@@ -42,6 +42,12 @@ _SLOW_STRIKES: Dict[str, int] = {}
 #: Built-in tools that can change the workspace.  ``patch`` is Hermes' real
 #: name; ``patch_file`` and ``file_edit`` are accepted aliases for older builds
 #: and third-party tools.
+#:
+#: ``skill_manage`` is deliberately absent.  It writes to
+#: ``get_hermes_home()/skills``, which is outside the workspace, so a checkpoint
+#: taken before it contains nothing about the change and restoring it cannot
+#: undo one.  Offering a rollback there was a false promise (see
+#: "Rollback is filesystem-only" in the README).
 MODIFYING_TOOLS = frozenset(
     {
         "terminal",
@@ -52,7 +58,17 @@ MODIFYING_TOOLS = frozenset(
         "file_edit",
         "apply_patch",
         "delete_file",
-        "skill_manage",
+    }
+)
+
+#: Workspace-modifying tools that can also change state Chronos cannot see or
+#: restore: databases, services, remote APIs, the user's own git remotes, and
+#: files outside the workspace.  Their runs are recorded in checkpoint metadata
+#: so a restore can name them.
+EXTERNAL_EFFECT_TOOLS = frozenset(
+    {
+        "terminal",
+        "execute_code",
     }
 )
 
@@ -108,10 +124,6 @@ def _describe(tool_name: str, args: Dict[str, Any]) -> str:
         if path:
             return f"Auto snapshot before {tool_name}: {_snippet(path, 100)}"
         return f"Auto snapshot before {tool_name}"
-    if tool_name == "skill_manage":
-        if path:
-            return f"Auto snapshot before skill_manage: {_snippet(path, 100)}"
-        return "Auto snapshot before skill_manage"
     if tool_name == "terminal":
         command = args.get("command")
         if command:
@@ -265,7 +277,9 @@ class ChronosHooks:
             "action": "approve",
             "message": (
                 f"Chronos wants to restore the workspace to checkpoint `{checkpoint}` {effect}. "
-                "A safety checkpoint of the current state is taken first, so this can be undone."
+                "A safety checkpoint of the current state is taken first, so the file restore "
+                "can be undone. Only files under the workspace are restored: database, "
+                "service, remote-API, and git-remote changes are not reverted."
             ),
         }
 
@@ -386,13 +400,21 @@ class ChronosHooks:
             if isinstance(result, dict) and "chronos_notice" in result:
                 return None
             checkpoint_id = notice["checkpoint_id"]
+            external = notice.get("tool_name") in EXTERNAL_EFFECT_TOOLS
             hint = (
                 "\n\n[Chronos] This tool call appears to have failed. "
                 f"Checkpoint `{checkpoint_id}` was captured before it ran.\n"
-                f"- Inspect the change: chronos_diff(from_checkpoint=\"{checkpoint_id}\")\n"
-                f"- Undo it: chronos_rollback(checkpoint_id=\"{checkpoint_id}\")\n"
-                "Rollback first creates a safety checkpoint, so the undo is reversible."
+                f"- Inspect the file changes: chronos_diff(from_checkpoint=\"{checkpoint_id}\")\n"
+                f"- Restore the workspace files: chronos_rollback(checkpoint_id=\"{checkpoint_id}\")\n"
+                "Rollback first creates a safety checkpoint, so the restore is reversible."
             )
+            if external:
+                hint += (
+                    f"\n- Only files under the workspace are restored. `{notice.get('tool_name')}` "
+                    "can also change databases, services, remote APIs, git remotes, or files "
+                    "outside the workspace, and Chronos cannot see or revert any of that. "
+                    "Say what may still be applied instead of reporting the failure as undone."
+                )
             if isinstance(result, dict):
                 # Hermes 0.19 passes structured tool results to this hook;
                 # current Hermes passes a JSON string.

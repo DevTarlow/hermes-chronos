@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0.3 - 2026-11-08
+
+Stop claiming more than a restore delivers: rollback is filesystem-only.
+
+- **`skill_manage` no longer triggers a checkpoint.** It writes to
+  `$HERMES_HOME/skills`, outside the workspace, so the snapshot captured nothing
+  about the change and restoring it could not undo one — yet a failed
+  `skill_manage` still got a "checkpoint captured before it ran / undo it" hint.
+  It is no longer in `MODIFYING_TOOLS`.
+- **The recovery hint no longer says "Undo it".** It says "restore the workspace
+  files", and for `terminal` / `execute_code` — the tools that can touch
+  databases, services, remote APIs, git remotes, and files outside the
+  workspace — it adds that Chronos cannot see or revert any of that and that the
+  failure should not be reported as undone.
+- **The approval prompt says the same**, so the decision to restore is made with
+  the caveat in view.
+- **README** gains "What a rollback does not undo": a table of what survives a
+  restore (databases, services, remote APIs, pushed git history, out-of-workspace
+  files, packages/caches) and a disclosure line in the catalog section.
+
+Structured per-rollback warnings (`unverified_external_calls` naming the
+`terminal` commands in the reverted range) are tracked as a follow-up issue, not
+in this release.
+
 ## 1.0.2 - 2026-11-05
 
 - **Demo links in the README.** The 88-second launch film

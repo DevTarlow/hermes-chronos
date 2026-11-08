@@ -43,6 +43,7 @@ from hermes_chronos.engine import (  # noqa: E402
     clear_engine_cache,
     get_engine,
 )
+from hermes_chronos import hooks as hooks_module  # noqa: E402
 from hermes_chronos.hooks import ChronosHooks  # noqa: E402
 from hermes_chronos.tools import ChronosTools  # noqa: E402
 from hermes_chronos.commands import (  # noqa: E402
@@ -349,6 +350,66 @@ class ToolsAndHooksTestCase(unittest.TestCase):
         self.assertIsInstance(transformed, str)
         self.assertIn("[Chronos]", transformed)
         self.assertIn("chronos_rollback", transformed)
+
+    def test_external_effect_hint_does_not_promise_a_full_undo(self):
+        """A restore is filesystem-only; the hint must say so for terminal/code."""
+        notice = {
+            "checkpoint_id": "abc12345",
+            "reason": "status=error",
+            "tool_name": "terminal",
+            "_stored_at": time.time(),
+        }
+        key = ("s-ext", "call-ext")
+        with hooks_module._STATE_LOCK:
+            hooks_module._NOTICES[key] = notice
+        transformed = self.hooks.transform_tool_result(
+            "terminal", {"command": "psql -f migrate.sql"}, result="boom",
+            session_id="s-ext", tool_call_id="call-ext",
+        )
+        self.assertIn("Restore the workspace files", transformed)
+        self.assertIn("Only files under the workspace are restored", transformed)
+        self.assertIn("databases", transformed)
+        self.assertNotIn("Undo it", transformed)
+
+    def test_file_only_hint_keeps_the_short_form(self):
+        with hooks_module._STATE_LOCK:
+            hooks_module._NOTICES[("s-file", "call-file")] = {
+                "checkpoint_id": "def67890",
+                "reason": "status=error",
+                "tool_name": "write_file",
+                "_stored_at": time.time(),
+            }
+        transformed = self.hooks.transform_tool_result(
+            "write_file", {"path": "a.py"}, result="boom",
+            session_id="s-file", tool_call_id="call-file",
+        )
+        self.assertIn("Restore the workspace files", transformed)
+        self.assertNotIn("databases", transformed)
+
+    def test_skill_manage_is_not_treated_as_a_workspace_tool(self):
+        """It writes to $HERMES_HOME/skills, so a checkpoint could not undo it."""
+        from hermes_chronos.hooks import MODIFYING_TOOLS
+
+        self.assertNotIn("skill_manage", MODIFYING_TOOLS)
+        before = len(json.loads(self.tools.list_checkpoints({"limit": 100}))["checkpoints"])
+        self.assertIsNone(
+            self.hooks.pre_tool_call(
+                "skill_manage", {"name": "deploy"}, session_id="s", tool_call_id="c"
+            )
+        )
+        after = len(json.loads(self.tools.list_checkpoints({"limit": 100}))["checkpoints"])
+        self.assertEqual(before, after)
+        # And no hint is queued for a failure, because there is no checkpoint to offer.
+        self.hooks.post_tool_call(
+            "skill_manage", {"name": "deploy"}, result="boom", status="error",
+            session_id="s", tool_call_id="c",
+        )
+        self.assertIsNone(
+            self.hooks.transform_tool_result(
+                "skill_manage", {"name": "deploy"}, result="boom",
+                session_id="s", tool_call_id="c",
+            )
+        )
 
     def test_hook_respects_auto_snapshot_false(self):
         self.ctx.config["auto_snapshot"] = False

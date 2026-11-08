@@ -3,6 +3,6 @@
   "label": "Chronos Time Travel",
   "description": "Scrub checkpoints, inspect file diffs, and restore the workspace from the Chronos timeline.",
   "icon": "history",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "api": "plugin_api.py"
 }
